@@ -4,7 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"github.com/PCJones/nntp-proxy/config"
+	"github.com/Cloudxtreme/nntp-proxy-2/config"
 	"golang.org/x/crypto/bcrypt"
 	"io"
 	"io/ioutil"
