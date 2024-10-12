@@ -4,7 +4,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"github.com/PCJones/nntp-proxy-2/config"
+	"github.com/Cloudxtreme/nntp-proxy/config"
 	"golang.org/x/crypto/bcrypt"
 	"io"
 	"io/ioutil"
@@ -14,14 +14,11 @@ import (
 	"net/textproto"
 	"os"
 	"strings"
-	"sync"
 )
 
 var (
 	cfg                config.Configuration
 	backendConnections map[string]int
-	userConnections    map[string]int
-	mu                 sync.Mutex
 )
 
 type session struct {
@@ -29,7 +26,6 @@ type session struct {
 	backendConnection net.Conn
 	command           string
 	selectedBackend   *config.SelectedBackend
-	username          string
 }
 
 // Utils
@@ -87,7 +83,6 @@ func main() {
 	cfg = LoadConfig("/config/config.json")
 
 	backendConnections = make(map[string]int)
-	userConnections = make(map[string]int)
 
 	for _, elem := range cfg.Backend {
 		backendConnections[elem.BackendName] = 0
@@ -192,20 +187,13 @@ func (s *session) handleRequests() {
 	}
 }
 
-func (s *session) handleAuthorization(user string, password string) (bool, string) {
-	mu.Lock()
-	defer mu.Unlock()
-
+func (s *session) handleAuthorization(user string, password string) bool {
 	for _, elem := range cfg.Users {
 		if elem.Username == user && CheckPasswordHash(password, elem.Password) {
-			if userConnections[user] >= elem.MaxConnections {
-				return false, "502 Too Many Connections"
-			}
-			userConnections[user]++
-			return true, ""
+			return true
 		}
 	}
-	return false, "502 Authentication Failed"
+	return false
 }
 
 func (s *session) handleAuth(args []string) {
@@ -231,100 +219,98 @@ func (s *session) handleAuth(args []string) {
 		return
 	}
 
-	success, message := s.handleAuthorization(args[1], parts[2])
-	if !success {
-		t.PrintfLine(message)
-		return
-	}
+	if s.handleAuthorization(args[1], parts[2]) {
+		selectedBackend := &config.SelectedBackend{}
+		for _, elem := range cfg.Backend {
 
-	selectedBackend := &config.SelectedBackend{}
-	for _, elem := range cfg.Backend {
+			if backendConnections[elem.BackendName] < elem.BackendConns {
+				selectedBackend.BackendName = elem.BackendName
+				selectedBackend.BackendAddr = elem.BackendAddr
+				selectedBackend.BackendPort = elem.BackendPort
+				selectedBackend.BackendTLS = elem.BackendTLS
+				selectedBackend.BackendUser = elem.BackendUser
+				selectedBackend.BackendPass = elem.BackendPass
 
-		if backendConnections[elem.BackendName] < elem.BackendConns {
-			selectedBackend.BackendName = elem.BackendName
-			selectedBackend.BackendAddr = elem.BackendAddr
-			selectedBackend.BackendPort = elem.BackendPort
-			selectedBackend.BackendTLS = elem.BackendTLS
-			selectedBackend.BackendUser = elem.BackendUser
-			selectedBackend.BackendPass = elem.BackendPass
+				backendConnections[elem.BackendName] += 1
+				break
+			} else {
+				continue
+			}
+		}
 
-			backendConnections[elem.BackendName] += 1
-			break
+		if len(selectedBackend.BackendAddr) == 0 && len(selectedBackend.BackendPort) == 0 {
+			t.PrintfLine("502 NO free backend connection!")
+			return
+		}
+
+		var conn net.Conn
+		var err error
+
+		if selectedBackend.BackendTLS {
+
+			conf := &tls.Config{
+				InsecureSkipVerify: true,
+			}
+
+			conn, err = tls.Dial("tcp", selectedBackend.BackendAddr+":"+selectedBackend.BackendPort, conf)
+
+			if err != nil {
+				log.Printf("%v", err)
+				log.Printf("%v:%v", selectedBackend.BackendAddr, selectedBackend.BackendPort)
+				return
+			}
+
 		} else {
-			continue
-		}
-	}
+			// New backend connection to upstream NNTP
+			conn, err = net.Dial("tcp", selectedBackend.BackendAddr+":"+selectedBackend.BackendPort)
 
-	if len(selectedBackend.BackendAddr) == 0 && len(selectedBackend.BackendPort) == 0 {
-		t.PrintfLine("502 NO free backend connection!")
-		return
-	}
-
-	var conn net.Conn
-	var err error
-
-	if selectedBackend.BackendTLS {
-
-		conf := &tls.Config{
-			InsecureSkipVerify: true,
+			if err != nil {
+				log.Printf("%v", err)
+				log.Printf("%v:%v", selectedBackend.BackendAddr, selectedBackend.BackendPort)
+				return
+			}
 		}
 
-		conn, err = tls.Dial("tcp", selectedBackend.BackendAddr+":"+selectedBackend.BackendPort, conf)
+		c := textproto.NewConn(conn)
+
+		_, _, err = c.ReadCodeLine(200)
+		if err != nil {
+			return
+		}
+
+		err = c.PrintfLine("authinfo user %s", selectedBackend.BackendUser)
 
 		if err != nil {
+			return
+		}
+
+		_, _, err = c.ReadCodeLine(381)
+		if err != nil {
+			return
+		}
+
+		err = c.PrintfLine("authinfo pass %s", selectedBackend.BackendPass)
+		if err != nil {
+			return
+		}
+		_, _, err = c.ReadCodeLine(281)
+
+		if err == nil {
+			t.PrintfLine("281 Welcome")
+			s.backendConnection = conn
+			s.selectedBackend = selectedBackend
+			log.Printf("[CONN] Connecting to Backend: %v", selectedBackend.BackendName)
+
+			return
+		} else {
 			log.Printf("%v", err)
-			log.Printf("%v:%v", selectedBackend.BackendAddr, selectedBackend.BackendPort)
+			backendConnections[selectedBackend.BackendName] -= 1
+			t.PrintfLine("502 Backend AUTH Failed!")
 			return
 		}
 
 	} else {
-		// New backend connection to upstream NNTP
-		conn, err = net.Dial("tcp", selectedBackend.BackendAddr+":"+selectedBackend.BackendPort)
-
-		if err != nil {
-			log.Printf("%v", err)
-			log.Printf("%v:%v", selectedBackend.BackendAddr, selectedBackend.BackendPort)
-			return
-		}
-	}
-
-	c := textproto.NewConn(conn)
-
-	_, _, err = c.ReadCodeLine(200)
-	if err != nil {
-		return
-	}
-
-	err = c.PrintfLine("authinfo user %s", selectedBackend.BackendUser)
-
-	if err != nil {
-		return
-	}
-
-	_, _, err = c.ReadCodeLine(381)
-	if err != nil {
-		return
-	}
-
-	err = c.PrintfLine("authinfo pass %s", selectedBackend.BackendPass)
-	if err != nil {
-		return
-	}
-	_, _, err = c.ReadCodeLine(281)
-
-	if err == nil {
-		t.PrintfLine("281 Welcome")
-		s.backendConnection = conn
-		s.selectedBackend = selectedBackend
-		s.username = args[1]
-		log.Printf("[CONN] Connecting to Backend: %v", selectedBackend.BackendName)
-
-		return
-	} else {
-		log.Printf("%v", err)
-		backendConnections[selectedBackend.BackendName] -= 1
-		t.PrintfLine("502 Backend AUTH Failed!")
-		return
+		t.PrintfLine("502 AUTH FAILED!")
 	}
 }
 
@@ -334,11 +320,10 @@ func handleRequest(conn net.Conn) {
 	c := textproto.NewConn(conn)
 
 	sess := &session{
-		UserConnection:    conn,
-		backendConnection: nil,
-		command:           "",
-		selectedBackend:   nil,
-		username:          "",
+		conn,
+		nil,
+		"",
+		nil,
 	}
 
 	c.PrintfLine("200 Welcome to NNTP Proxy!")
@@ -346,10 +331,6 @@ func handleRequest(conn net.Conn) {
 	for {
 		l, err := c.ReadLine()
 		if err != nil {
-			mu.Lock()
-			if sess.username != "" {
-				userConnections[sess.username]--
-			}
 			if sess.selectedBackend != nil && len(sess.selectedBackend.BackendName) > 0 {
 				backendConnections[sess.selectedBackend.BackendName] -= 1
 				log.Printf("[CONN] Dropping Backend Connection: %v", sess.selectedBackend.BackendName)
@@ -357,10 +338,12 @@ func handleRequest(conn net.Conn) {
 				log.Printf("[CONN] Error dropping Backend Connection cause selectedBackend is nil")
 				log.Printf("%v", sess)
 				sess.selectedBackend = nil
+
 			}
-			mu.Unlock()
+
 			conn.Close()
 			return
+
 		}
 
 		sess.command = l
